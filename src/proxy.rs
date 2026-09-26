@@ -1,8 +1,16 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use axum::{
+    body::Body,
+    extract::Path,
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::Response,
+};
 
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +21,351 @@ const MAX_HEADERS: usize = 64;
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const CHUNK_IDLE_TIMEOUT_SECS: u64 = 60;
 const WATCHDOG_IDLE_SECS: u64 = 600;
+const PUBLIC_PROXY_TTL_SECS: u64 = 2 * 60 * 60;
+
+#[derive(Clone)]
+struct PublicProxyEntry {
+    target_url: String,
+    headers: Vec<(String, String)>,
+    subtitle_url: Option<String>,
+    created_at: Instant,
+}
+
+static PUBLIC_PROXY_REGISTRY: OnceLock<RwLock<HashMap<String, PublicProxyEntry>>> =
+    OnceLock::new();
+
+fn public_proxy_registry() -> &'static RwLock<HashMap<String, PublicProxyEntry>> {
+    PUBLIC_PROXY_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn register_public_proxy(
+    target_url: &str,
+    headers: &[(String, String)],
+    subtitle_url: Option<&str>,
+) -> Result<String, String> {
+    use rand::RngExt;
+
+    let mut rng = rand::rng();
+    let token: String = (0..32)
+        .map(|_| format!("{:x}", rng.random_range(0..16)))
+        .collect();
+
+    let entry = PublicProxyEntry {
+        target_url: target_url.to_string(),
+        headers: headers.to_vec(),
+        subtitle_url: subtitle_url.map(str::to_string),
+        created_at: Instant::now(),
+    };
+
+    let registry = public_proxy_registry();
+
+    {
+        let mut map = registry
+            .write()
+            .map_err(|_| "public proxy registry lock poisoned".to_string())?;
+
+        map.retain(|_, value| value.created_at.elapsed().as_secs() < PUBLIC_PROXY_TTL_SECS);
+        map.insert(token.clone(), entry);
+    }
+
+    let public_base = std::env::var("PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string())
+        .trim_end_matches('/')
+        .to_string();
+
+    let path = if let Some(rest) = target_url.strip_prefix("https://") {
+        format!("/public-proxy/{token}/https/{rest}")
+    } else if let Some(rest) = target_url.strip_prefix("http://") {
+        format!("/public-proxy/{token}/http/{rest}")
+    } else {
+        format!("/public-proxy/{token}/https/{target_url}")
+    };
+
+    Ok(format!("{public_base}{path}"))
+}
+
+pub async fn public_proxy(
+    Path(path): Path<String>,
+    method: axum::http::Method,
+    request_headers: HeaderMap,
+) -> Response {
+    let mut parts = path.splitn(2, '/');
+    let token = parts.next().unwrap_or("");
+    let target_path = parts.next().unwrap_or("");
+
+    if token.is_empty() || target_path.is_empty() {
+        return proxy_error_response(StatusCode::BAD_REQUEST, "Invalid public proxy path");
+    }
+
+    let entry = {
+        let registry = public_proxy_registry();
+        let map = match registry.read() {
+            Ok(map) => map,
+            Err(_) => {
+                return proxy_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Public proxy registry unavailable",
+                );
+            }
+        };
+
+        match map.get(token) {
+            Some(entry) if entry.created_at.elapsed().as_secs() < PUBLIC_PROXY_TTL_SECS => {
+                entry.clone()
+            }
+            _ => {
+                return proxy_error_response(StatusCode::NOT_FOUND, "Public proxy expired");
+            }
+        }
+    };
+
+    let target_url = match extract_target_url(&format!("/{target_path}")) {
+        Some(url) => url,
+        None => return proxy_error_response(StatusCode::BAD_REQUEST, "Invalid target URL"),
+    };
+
+    let target_host = extract_host_authority(&entry.target_url);
+    let extracted_host = extract_host_authority(&target_url);
+    let sub_host = entry
+        .subtitle_url
+        .as_deref()
+        .and_then(extract_host_authority);
+
+    let allowed = match (target_host.as_deref(), extracted_host.as_deref()) {
+        (Some(allowed), Some(extracted)) => {
+            extracted == allowed || (sub_host.is_some() && extracted_host == sub_host)
+        }
+        _ => false,
+    };
+
+    if !allowed {
+        return proxy_error_response(StatusCode::FORBIDDEN, "Target host is not allowed");
+    }
+
+    let client = match crate::net::streaming_client_builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return proxy_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Proxy client error: {error}"),
+            );
+        }
+    };
+
+    let mut req = match method {
+        axum::http::Method::HEAD => client.head(&target_url),
+        _ => client.get(&target_url),
+    };
+
+    let forward_all_headers = extracted_host.as_deref() == target_host.as_deref();
+
+    for (name, value) in &entry.headers {
+        if forward_all_headers || name.eq_ignore_ascii_case("user-agent") {
+            req = req.header(name.as_str(), value.as_str());
+        }
+    }
+
+    if let Some(range) = request_headers.get(axum::http::header::RANGE) {
+        req = req.header(
+            reqwest::header::RANGE,
+            range.to_str().unwrap_or_default(),
+        );
+    }
+
+    let upstream = match req.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return proxy_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("Upstream request failed: {error}"),
+            );
+        }
+    };
+
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+
+    let is_dash_manifest = target_url.ends_with(".mpd")
+        || upstream_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.contains("dash+xml") || value.contains("xml"))
+            .unwrap_or(false);
+
+    let content_length = upstream_headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
+
+    let within_manifest_limit =
+        content_length.is_none_or(|length| length <= MAX_MANIFEST_BYTES);
+
+    if is_dash_manifest && status.is_success() && within_manifest_limit {
+        let manifest_bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return proxy_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Manifest read failed: {error}"),
+                );
+            }
+        };
+
+        if manifest_bytes.len() > MAX_MANIFEST_BYTES {
+            return proxy_error_response(StatusCode::BAD_GATEWAY, "Manifest too large");
+        }
+
+        let manifest = String::from_utf8_lossy(&manifest_bytes);
+        let rewritten = rewrite_public_dash_manifest(
+            &manifest,
+            token,
+            target_host.as_deref(),
+            entry.subtitle_url.as_deref(),
+        );
+
+        let mut response = Response::new(Body::from(rewritten));
+        *response.status_mut() = StatusCode::OK;
+
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/dash+xml"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+
+        return response;
+    }
+
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+
+    *response.status_mut() =
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    copy_proxy_headers(&mut response, &upstream_headers, &target_url);
+
+    response
+}
+
+fn proxy_error_response(status: StatusCode, message: &str) -> Response {
+    let mut response = Response::new(Body::from(message.to_string()));
+    *response.status_mut() = status;
+
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+
+    response
+}
+
+fn copy_proxy_headers(
+    response: &mut Response,
+    headers: &reqwest::header::HeaderMap,
+    target_url: &str,
+) {
+    let clean_path = target_url
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let is_srt = clean_path.ends_with(".srt");
+    let is_vtt = clean_path.ends_with(".vtt");
+
+    for (name, value) in headers {
+        if name.as_str().eq_ignore_ascii_case("content-type")
+            || name.as_str().eq_ignore_ascii_case("content-length")
+            || name.as_str().eq_ignore_ascii_case("content-range")
+            || name.as_str().eq_ignore_ascii_case("accept-ranges")
+        {
+            if (is_srt || is_vtt) && name.as_str().eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+
+            if let Ok(value) = HeaderValue::from_bytes(value.as_bytes()) {
+                if let Ok(name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+                    response.headers_mut().insert(name, value);
+                }
+            }
+        }
+    }
+
+    if is_srt {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-subrip"),
+        );
+    } else if is_vtt {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/vtt"),
+        );
+    }
+
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+}
+
+fn rewrite_public_dash_manifest(
+    manifest: &str,
+    token: &str,
+    target_host: Option<&str>,
+    subtitle_url: Option<&str>,
+) -> String {
+    let Some(host) = target_host else {
+        return manifest.to_string();
+    };
+
+    let https_prefix = format!("https://{host}/");
+    let http_prefix = format!("http://{host}/");
+
+    let proxy_https = format!("/public-proxy/{token}/https/{host}/");
+    let proxy_http = format!("/public-proxy/{token}/http/{host}/");
+
+    let mut rewritten = manifest
+        .replace(&https_prefix, &proxy_https)
+        .replace(&http_prefix, &proxy_http);
+
+    if let Some(sub) = subtitle_url {
+        if !sub.is_empty() {
+            let encoded_sub =
+                percent_encoding::utf8_percent_encode(sub, percent_encoding::NON_ALPHANUMERIC);
+
+            let sub_proxy_url =
+                format!("/public-proxy/{token}/sub/{encoded_sub}");
+
+            let sub_adaptation_set = format!(
+                r#"<AdaptationSet contentType="text" mimeType="text/vtt" lang="en">
+    <Role schemeIdUri="urn:mpeg:dash:role:2011" value="subtitle"/>
+    <Representation id="sub_en" bandwidth="1000">
+      <BaseURL>{sub_proxy_url}</BaseURL>
+    </Representation>
+  </AdaptationSet>
+</Period>"#
+            );
+
+            if rewritten.contains("</Period>") {
+                rewritten = rewritten.replacen("</Period>", &sub_adaptation_set, 1);
+            }
+        }
+    }
+
+    rewritten
+}
 
 struct ConnectionGuard {
     conns: Arc<AtomicUsize>,

@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
-    routing::get,
+    routing::{any, get},
 };
 
 use serde::Deserialize;
@@ -234,9 +234,10 @@ async fn stream(
                 .map(|mirror| mirror.headers.clone())
                 .unwrap_or_default();
 
-            // Use MovieBox-Tui's existing local DASH proxy so the
-            // browser does not access the signed CDN manifest directly.
-            let proxy_url = moviebox_tui::proxy::spawn_sidecar(&direct_url, &headers, None).ok()?;
+            // Register a public proxy on this API service so browsers
+            // can reach the stream through Render instead of localhost.
+            let proxy_url =
+                moviebox_tui::proxy::register_public_proxy(&direct_url, &headers, None).ok()?;
 
             Some(json!({
                 "url": proxy_url,
@@ -297,6 +298,10 @@ async fn main() {
         .route("/search/suggest", get(suggestions))
         .route("/detail/{id}", get(details))
         .route("/api/stream/{subject_id}", get(stream))
+        .route(
+            "/public-proxy/{*path}",
+            any(moviebox_tui::proxy::public_proxy),
+        )
         .layer(CorsLayer::permissive())
         .with_state(service);
 
