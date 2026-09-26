@@ -300,7 +300,8 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(service);
 
-    let address = "0.0.0.0:8000";
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".to_string());
+    let address = format!("0.0.0.0:{}", port);
 
     println!();
     println!("Movie Web API running at:");
