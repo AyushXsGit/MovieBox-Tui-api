@@ -1,4 +1,9 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use tokio::process::Command;
 
 use axum::{
     Router,
@@ -263,6 +268,93 @@ async fn stream(
 }
 
 // ======================================================
+// DOWNLOAD
+// ======================================================
+
+async fn download(
+    State(service): State<AppState>,
+    Path(subject_id): Path<String>,
+    Query(params): Query<StreamQuery>,
+) -> Result<(StatusCode, [(axum::http::HeaderName, String); 2], Vec<u8>), (StatusCode, Json<Value>)> {
+    let season = params.se.unwrap_or(0);
+    let episode = params.ep.unwrap_or(0);
+
+    let releases = service
+        .client
+        .episode_streams(&subject_id, season, episode)
+        .await
+        .map_err(api_error)?;
+
+    let release = releases
+        .into_iter()
+        .find_map(|release| {
+            let direct_url = release.direct_url().map(|value| value.to_string())?;
+            Some((direct_url, release))
+        })
+        .ok_or_else(|| api_error("No downloadable source found"))?;
+
+    let (direct_url, release) = release;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let filename = format!(
+        "movie-{}-{}-{}-{}.mp4",
+        subject_id,
+        season,
+        episode,
+        stamp
+    );
+
+    let output = format!("/tmp/{}", filename);
+
+    let status = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(&direct_url)
+        .arg("-c")
+        .arg("copy")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&output)
+        .status()
+        .await
+        .map_err(|error| api_error(format!("Failed to start FFmpeg: {}", error)))?;
+
+    if !status.success() {
+        return Err(api_error(format!(
+            "FFmpeg failed with status: {}",
+            status
+        )));
+    }
+
+    let data = tokio::fs::read(&output)
+        .await
+        .map_err(|error| api_error(format!("Failed to read downloaded file: {}", error)))?;
+
+    let _ = tokio::fs::remove_file(&output).await;
+
+    let content_type = "video/mp4".to_string();
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+
+    println!(
+        "Download complete: {} (quality={:?}, codec={:?})",
+        filename, release.quality, release.codec
+    );
+
+    Ok((
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CONTENT_DISPOSITION, disposition),
+        ],
+        data,
+    ))
+}
+
+// ======================================================
 // MAIN
 // ======================================================
 
@@ -298,6 +390,7 @@ async fn main() {
         .route("/search/suggest", get(suggestions))
         .route("/detail/{id}", get(details))
         .route("/api/stream/{subject_id}", get(stream))
+        .route("/api/download/{subject_id}", get(download))
         .route(
             "/public-proxy/{*path}",
             any(moviebox_tui::proxy::public_proxy),
