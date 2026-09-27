@@ -33,6 +33,7 @@ struct SearchQuery {
 struct StreamQuery {
     se: Option<usize>,
     ep: Option<usize>,
+    quality: Option<String>,
 }
 
 fn api_error(error: impl ToString) -> (StatusCode, Json<Value>) {
@@ -285,15 +286,43 @@ async fn download(
         .await
         .map_err(api_error)?;
 
-    let release = releases
-        .into_iter()
-        .find_map(|release| {
-            let direct_url = release.direct_url().map(|value| value.to_string())?;
-            Some((direct_url, release))
-        })
-        .ok_or_else(|| api_error("No downloadable source found"))?;
+    let requested_quality = params.quality.as_deref();
 
-    let (direct_url, release) = release;
+    let release = if let Some(quality) = requested_quality {
+        releases
+            .iter()
+            .find(|release| {
+                release.direct_url().is_some()
+                    && release
+                        .quality
+                        .as_deref()
+                        .map(|value| value.eq_ignore_ascii_case(quality))
+                        .unwrap_or(false)
+            })
+            .or_else(|| releases.iter().find(|release| release.direct_url().is_some()))
+            .cloned()
+    } else {
+        releases
+            .iter()
+            .find(|release| release.direct_url().is_some())
+            .cloned()
+    }
+    .ok_or_else(|| api_error("No downloadable source found"))?;
+
+    let direct_url = release
+        .direct_url()
+        .map(|value| value.to_string())
+        .ok_or_else(|| api_error("Selected source has no direct URL"))?;
+
+    let headers = release
+        .mirrors
+        .first()
+        .map(|mirror| mirror.headers.clone())
+        .unwrap_or_default();
+
+    let download_url =
+        moviebox_tui::proxy::register_public_proxy(&direct_url, &headers, None)
+            .map_err(api_error)?;
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -313,7 +342,7 @@ async fn download(
     let status = Command::new("ffmpeg")
         .arg("-y")
         .arg("-i")
-        .arg(&direct_url)
+        .arg(&download_url)
         .arg("-c")
         .arg("copy")
         .arg("-movflags")
