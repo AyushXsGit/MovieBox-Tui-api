@@ -137,8 +137,6 @@ function makeClientProfile() {
   return { userAgent, clientInfo, spoofedIp: randomIp() };
 }
 
-const profile = makeClientProfile();
-
 function md5Hex(data) {
   return createHash("md5").update(data).digest("hex");
 }
@@ -162,6 +160,9 @@ const SIGNATURE_SECRET = Buffer.from(
 );
 
 function signedHeaders(method, url, body, authToken) {
+  // Generate per-request client identity inside the request path. Cloudflare
+  // Workers disallow crypto random operations during module initialization.
+  const profile = makeClientProfile();
   const timestamp = Date.now();
   const bodyText = body ?? "";
   const bodyBytes = Buffer.from(bodyText);
@@ -548,6 +549,8 @@ function resolveDashManifest(signCookie) {
 }
 
 function streamReleases(payload, season, episode) {
+  // Must run inside a request, not during module initialization.
+  const profile = makeClientProfile();
   const data = payload?.data ?? payload;
   const streams = Array.isArray(data?.streams) ? data.streams : [];
   const rawTitle = data?.title || "MovieBox Stream";

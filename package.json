@@ -1,5 +1,5 @@
 {
-  "name": "moviebox-tui-api-cloudflare",
+  "name": "moviebox-tui-api",
   "private": true,
   "version": "1.0.0",
   "scripts": {

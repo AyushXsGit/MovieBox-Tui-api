@@ -1,4 +1,4 @@
-name = "moviebox-tui-api-cloudflare"
+name = "moviebox-tui-api"
 main = "cloudflare/worker.js"
 compatibility_date = "2026-09-28"
 
