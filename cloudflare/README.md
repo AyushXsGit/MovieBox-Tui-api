@@ -1,32 +1,23 @@
-# Cloudflare bridge for MovieBox TUI API
+# Cloudflare Worker
 
-The original Rust/Axum backend is preserved. The Cloudflare Workers bridge is
-an additional layer in `cloudflare/worker.js`.
+This directory contains the native Cloudflare Worker used for the web API.
 
-## What it does
+It replaces the previous Worker bridge that forwarded requests to Render.
 
-- Proxies the existing backend routes through Cloudflare.
-- Preserves `/public-proxy/...` by forwarding it to the existing Rust proxy.
-- Rewrites `/api/stream/...` JSON so browser-facing `url` and `proxy_url`
-  values use the Cloudflare Worker hostname.
-- Preserves Range requests and streaming responses.
-- Adds CORS headers.
-- Does not remove the Rust backend, FFmpeg code, tests, docs, or workflows.
+## Required secret
 
-## Git/Cloudflare setup
+`PROXY_SECRET`
 
-Root directory: `/`
-Build/deploy command: `npx wrangler deploy`
+Create it in Cloudflare Workers -> Settings -> Variables and Secrets -> Secrets.
 
-Worker name: `moviebox-tui-api-cloudflare`
+## API
 
-The current origin is:
-`https://moviebox-tui-api.onrender.com`
+- `/health`
+- `/home`
+- `/search?q=...`
+- `/search/suggest?q=...`
+- `/detail/:id`
+- `/api/stream/:id?se=...&ep=...`
+- `/public-proxy/...`
 
-Keep the Render origin running until Cloudflare has been tested for `/home`,
-`/search`, `/detail/...`, `/api/stream/...`, `/public-proxy/...` and the
-external-player flow.
-
-This is a Cloudflare bridge, not a conversion of the Rust/Axum server into a
-native Worker. The Rust origin remains responsible for its stateful public
-proxy and FFmpeg/download functionality.
+The original Rust implementation remains under `src/` and is not removed.

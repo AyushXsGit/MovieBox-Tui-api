@@ -2,5 +2,5 @@ name = "moviebox-tui-api-cloudflare"
 main = "cloudflare/worker.js"
 compatibility_date = "2026-09-28"
 
-[vars]
-BACKEND_ORIGIN = "https://moviebox-tui-api.onrender.com"
+# PROXY_SECRET MUST be configured as a Cloudflare Worker Secret.
+# Do not commit the secret to Git.
