@@ -195,6 +195,7 @@ function signedHeaders(method, url, body, authToken) {
     "User-Agent": profile.userAgent,
     "Accept": "application/json",
     "Content-Type": "application/json",
+    "Connection": "keep-alive",
     "x-client-token": clientToken,
     "x-tr-signature": signature,
     "x-client-info": profile.clientInfo,
