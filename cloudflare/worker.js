@@ -287,8 +287,11 @@ async function upstreamRequest(path, method = "GET", body = null) {
 }
 
 async function login() {
+  const diagnostics = [];
+
   for (let attempt = 0; attempt < HOST_POOL.length; attempt++) {
     const index = (activeBaseIndex + attempt) % HOST_POOL.length;
+    const host = new URL(HOST_POOL[index]).host;
     const url = `${HOST_POOL[index]}/wefeed-mobile-bff/user-api/visitor-login`;
 
     try {
@@ -298,21 +301,43 @@ async function login() {
         body: "{}",
       });
 
-      if (!response.ok) continue;
+      const contentType = response.headers.get("content-type") || "";
+      const status = response.status;
 
-      const raw = await response.json();
+      if (!response.ok) {
+        diagnostics.push(`${host}:HTTP_${status}`);
+        continue;
+      }
+
+      let raw;
+      try {
+        raw = await response.json();
+      } catch {
+        diagnostics.push(`${host}:INVALID_JSON`);
+        continue;
+      }
+
       const payload = raw?.data !== undefined ? raw.data : raw;
       const token = extractToken(payload);
-      if (!token) continue;
+
+      if (!token) {
+        diagnostics.push(`${host}:NO_TOKEN`);
+        continue;
+      }
 
       sessionToken = token;
       sessionExpiresAt = tokenExpiry(token);
       activeBaseIndex = index;
       return token;
-    } catch {}
+    } catch (error) {
+      diagnostics.push(`${host}:${error?.name || "FETCH_ERROR"}`);
+    }
   }
 
-  throw new Error("Unable to create upstream session");
+  console.warn("Upstream visitor-login failed", diagnostics);
+  throw new Error(
+    `Unable to create upstream session (${diagnostics.join(", ") || "no diagnostics"})`
+  );
 }
 
 async function sleep(ms) {
