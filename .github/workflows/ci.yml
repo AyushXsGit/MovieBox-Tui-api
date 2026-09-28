@@ -89,4 +89,4 @@ jobs:
           MOVIEBOX_DATA_DIR: ${{ runner.temp }}/mb_data
         run: cargo nextest run --all-features --locked
       - name: Smoke-test binary startup
-        run: cargo run --all-features --locked -- --version
+        run: cargo run --all-features --locked --bin moviebox-tui -- --version
