@@ -33,6 +33,7 @@ const DEFAULT_PROXY_TTL = 2 * 60 * 60;
 let sessionToken = null;
 let sessionExpiresAt = 0;
 let activeBaseIndex = 0;
+let clientProfile = null;
 
 function requireProxySecret(env) {
   const secret = String(env?.PROXY_SECRET || "").trim();
@@ -162,7 +163,7 @@ const SIGNATURE_SECRET = Buffer.from(
 function signedHeaders(method, url, body, authToken) {
   // Generate per-request client identity inside the request path. Cloudflare
   // Workers disallow crypto random operations during module initialization.
-  const profile = makeClientProfile();
+  const profile = clientProfile || (clientProfile = makeClientProfile());
   const timestamp = Date.now();
   const bodyText = body ?? "";
   const bodyBytes = Buffer.from(bodyText);
