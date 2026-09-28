@@ -1,0 +1,6 @@
+name = "moviebox-tui-api-cloudflare"
+main = "cloudflare/worker.js"
+compatibility_date = "2026-09-28"
+
+[vars]
+BACKEND_ORIGIN = "https://moviebox-tui-api.onrender.com"
