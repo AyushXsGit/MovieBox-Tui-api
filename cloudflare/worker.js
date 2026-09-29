@@ -307,7 +307,15 @@ async function login() {
       const status = response.status;
 
       if (!response.ok) {
-        diagnostics.push(`${host}:HTTP_${status}`);
+        let detail = "";
+        try {
+          const text = await response.text();
+          detail = text.slice(0, 300).replace(/[\\r\\n]+/g, " ");
+        } catch {}
+
+        diagnostics.push(
+          `${host}:HTTP_${status}${detail ? `:${detail}` : ""}`
+        );
         continue;
       }
 
