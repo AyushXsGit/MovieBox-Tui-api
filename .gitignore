@@ -1,0 +1,8 @@
+target/
+.env
+.env.*
+*.env
+moviebox_worker_token.txt
+.wrangler/
+node_modules/
+*.log

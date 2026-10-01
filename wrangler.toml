@@ -1,0 +1,10 @@
+name = "moviebox-tui-api"
+main = "cloudflare/worker.js"
+compatibility_date = "2026-09-28"
+
+[[vpc_services]]
+binding = "MOVIEBOX_API"
+service_id = "01a0f673-1ba3-7cf1-bc6f-c5a87ca07e7b"
+
+# PROXY_SECRET MUST be configured as a Cloudflare Worker Secret.
+# Do not commit the secret to Git.

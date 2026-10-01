@@ -1,0 +1,5 @@
+Cloudflare native migration Step 2.
+Original repository files are preserved. Cloudflare now uses cloudflare/worker.js directly.
+Render is not referenced by the Worker runtime.
+PROXY_SECRET must be stored as a Cloudflare Worker Secret.
+The Rust/Axum backend remains in the repository intentionally and is not deleted.
